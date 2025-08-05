@@ -5,6 +5,9 @@ import hashlib
 import numpy as np
 import asyncio
 import requests
+import io
+import PyPDF2
+from typing import List  # <-- IMPORTANT: Add this import
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 from langchain_together import ChatTogether, TogetherEmbeddings
@@ -27,7 +30,7 @@ CHAT_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
 class QuestionRequest(BaseModel):
     documents: str
-    questions: List[str]
+    questions: List[str]  # <-- This now works with the List import
 
 class AnswerResponse(BaseModel):
     answers: List[str]
