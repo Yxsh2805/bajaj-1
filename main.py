@@ -7,12 +7,13 @@ import asyncio
 import requests
 import io
 import PyPDF2
-from typing import List  # <-- IMPORTANT: Add this import
+from typing import List, Optional, Dict, Any  # <-- Added all necessary typing imports
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 from langchain_together import ChatTogether, TogetherEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.messages import HumanMessage  # <-- Added import for HumanMessage
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +31,7 @@ CHAT_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
 class QuestionRequest(BaseModel):
     documents: str
-    questions: List[str]  # <-- This now works with the List import
+    questions: List[str]
 
 class AnswerResponse(BaseModel):
     answers: List[str]
@@ -229,7 +230,6 @@ Instructions:
 - If answer unknown: "Info not found"
 - Include key numbers when available"""
 
-        from langchain_core.messages import HumanMessage
         response = self.chat_model.invoke([HumanMessage(content=prompt)])
         return self._parse_answers(response.content, len(questions))
 
