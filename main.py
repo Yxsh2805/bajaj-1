@@ -213,10 +213,9 @@ class UltraSpeedRAGEngine:
             api_key = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             os.environ["TOGETHER_API_KEY"] = api_key
             
-            # Together.AI embeddings with caching
+            # Fixed: Together.AI embeddings without model_kwargs timeout
             self.embeddings = TogetherEmbeddings(
-                model="BAAI/bge-base-en-v1.5",
-                model_kwargs={"timeout": 5}  # Add timeout
+                model="BAAI/bge-base-en-v1.5"
             )
             
             # Faster model with lower latency
