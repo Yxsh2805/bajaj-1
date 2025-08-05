@@ -2,23 +2,11 @@ import os
 import time
 import logging
 import hashlib
-from datetime import datetime
-from typing import List, Optional, Dict, Any
-from contextlib import asynccontextmanager
-import requests
-from bs4 import BeautifulSoup
-import PyPDF2
-from docx import Document as DocxDocument
-import email
-import io
 import numpy as np
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
+import requests
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-
-# RAG imports
 from langchain_together import ChatTogether, TogetherEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -29,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 EXPECTED_TOKEN = "5aa05ad358e859e92978582cde20423149f28beb49da7a2bbb487afa8fce1be8"
 
+# --- Constants ---
+EMBEDDING_MODELS = [
+    "BAAI/bge-base-en-v1.5",  # Primary reliable model
+    "togethercomputer/m2-bert-80M-8k-retrieval",  # Fallback 1
+    "togethercomputer/m2-bert-80M-32k-retrieval"  # Fallback 2
+]
+CHAT_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+
 class QuestionRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -36,65 +32,62 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-class ReliabilityOptimizedVectorStore:
-    def __init__(self, embeddings):
-        self.embeddings = embeddings
+class RobustVectorStore:
+    def __init__(self):
+        self.embeddings = None
         self.documents = []
         self.vectors = []
+        self.initialize_embeddings()
     
-    def add_documents_reliable(self, documents: List[Document]):
-        """Optimized for reliability with Together.ai API"""
-        logger.info(f"RELIABILITY: Processing {len(documents)} chunks")
+    def initialize_embeddings(self):
+        """Initialize embeddings with fallback models"""
+        for model in EMBEDDING_MODELS:
+            try:
+                self.embeddings = TogetherEmbeddings(model=model)
+                logger.info(f"Using embedding model: {model}")
+                return
+            except Exception as e:
+                logger.warning(f"Model {model} failed: {str(e)[:60]}")
         
+        raise RuntimeError("All embedding models failed to initialize")
+    
+    def add_documents(self, documents: List[Document]):
+        logger.info(f"Processing {len(documents)} chunks")
         start_time = time.time()
-        texts = [doc.page_content for doc in documents]
         
-        # Filter out empty texts to prevent 400 errors
-        valid_texts = []
-        valid_docs = []
-        for i, text in enumerate(texts):
-            if text.strip() and len(text) > 10:  # Minimum length check
-                valid_texts.append(text)
-                valid_docs.append(documents[i])
-            else:
-                logger.warning(f"Skipping empty/short chunk: {text[:50]}...")
+        # Filter empty documents
+        valid_docs = [doc for doc in documents if doc.page_content.strip()]
         
-        if not valid_texts:
-            logger.error("No valid texts to embed")
-            return
+        # Batch processing with retries
+        for attempt in range(3):
+            try:
+                texts = [doc.page_content for doc in valid_docs]
+                vectors = self.embeddings.embed_documents(texts)
+                
+                # Store results
+                for doc, vector in zip(valid_docs, vectors):
+                    self.documents.append(doc)
+                    self.vectors.append(vector)
+                
+                logger.info(f"Embedded {len(vectors)} chunks in {time.time()-start_time:.1f}s")
+                return
+            except Exception as e:
+                logger.error(f"Batch embedding attempt {attempt+1} failed: {str(e)[:60]}")
+                time.sleep(0.5 * (attempt + 1))
         
-        try:
-            # Batch embedding for efficiency (Together.ai supports batch)
-            vectors = self.embeddings.embed_documents(valid_texts)
-            
-            # Store results
-            for doc, vector in zip(valid_docs, vectors):
-                self.documents.append(doc)
-                self.vectors.append(vector)
-            
-            success_rate = (len(vectors) / len(documents)) * 100
-            logger.info(f"RELIABILITY: Embedded {len(vectors)}/{len(documents)} chunks in {time.time()-start_time:.1f}s ({success_rate:.1f}% success)")
-        except Exception as e:
-            logger.error(f"Batch embedding failed: {e}")
-            # Fallback: Individual embedding with retries
-            self._fallback_embedding(valid_docs)
-
-    def _fallback_embedding(self, documents: List[Document]):
-        """Fallback for when batch embedding fails"""
-        logger.warning("Using fallback embedding method")
-        for i, doc in enumerate(documents):
+        # Fallback to individual embedding
+        logger.warning("Using fallback individual embedding")
+        for i, doc in enumerate(valid_docs):
             try:
                 vector = self.embeddings.embed_query(doc.page_content)
                 self.documents.append(doc)
                 self.vectors.append(vector)
-                # Add delay to avoid rate limiting
                 if i % 5 == 0:
                     time.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Failed to embed chunk {i}: {str(e)[:60]}")
+            except Exception:
+                logger.error(f"Failed to embed chunk {i}")
 
-    def similarity_search(self, query: str, k: int = 6) -> List[Document]:
-        """Efficient similarity search with error handling"""
+    def similarity_search(self, query: str, k: int = 5) -> List[Document]:
         if not self.vectors:
             return []
         
@@ -114,235 +107,170 @@ class ReliabilityOptimizedVectorStore:
                 top_indices = np.argsort(similarities)[-k:][::-1]
                 return [self.documents[i] for i in top_indices]
             return []
-        except Exception as e:
-            logger.error(f"Search error: {e}")
-            return self.documents[:k] if self.documents else []
+        except Exception:
+            return self.documents[:k]
 
-def reliable_document_loader(url: str) -> List[Document]:
-    """Optimized loader for ≤25 page documents"""
+def load_document(url: str) -> str:
+    """Simplified document loader focusing on text extraction"""
     try:
-        response = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
+        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
-        content_type = response.headers.get('content-type', '').lower()
-        
-        if 'pdf' in content_type or url.lower().endswith('.pdf'):
-            return _load_pdf(response.content, url)
-        elif 'wordprocessingml' in content_type or url.lower().endswith('.docx'):
-            return _load_docx(response.content, url)
-        else:
-            return _load_html(response.content, url)
+        if 'pdf' in response.headers.get('content-type', '').lower():
+            return extract_pdf_text(response.content)
+        return response.text[:100000]  # Limit HTML/text
     except Exception as e:
         logger.error(f"Document load error: {e}")
-        raise HTTPException(status_code=400, detail=f"Document loading failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Document loading failed")
 
-def _load_pdf(content: bytes, url: str) -> List[Document]:
-    """Load all pages for PDFs ≤25 pages"""
-    pdf_file = io.BytesIO(content)
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    total_pages = len(pdf_reader.pages)
-    
-    # Process all pages (≤25 pages)
-    text = ""
-    for i in range(total_pages):
-        page_text = pdf_reader.pages[i].extract_text()
-        if page_text.strip():
-            text += f"Page {i+1}: {page_text}\n\n"
-    
-    logger.info(f"Loaded PDF with {total_pages} pages")
-    return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
+def extract_pdf_text(content: bytes) -> str:
+    """Extract text from PDF with PyPDF2"""
+    try:
+        pdf_file = io.BytesIO(content)
+        reader = PyPDF2.PdfReader(pdf_file)
+        return "\n\n".join(page.extract_text() for page in reader.pages)
+    except Exception:
+        return "PDF content could not be extracted"
 
-def _load_docx(content: bytes, url: str) -> List[Document]:
-    """Load DOCX documents"""
-    docx_file = io.BytesIO(content)
-    doc = DocxDocument(docx_file)
-    text = "\n".join([para.text for para in doc.paragraphs])
-    return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
-
-def _load_html(content: bytes, url: str) -> List[Document]:
-    """Load HTML content"""
-    soup = BeautifulSoup(content, 'html.parser')
-    for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
-        element.decompose()
-    text = soup.get_text()
-    lines = (line.strip() for line in text.splitlines())
-    text = '\n'.join(line for line in lines if line)
-    return [Document(page_content=text[:80000], metadata={"source": url, "type": "html"})]
-
-class ReliabilityOptimizedRAGEngine:
+class RobustRAGEngine:
     def __init__(self):
         self.chat_model = None
-        self.embeddings = None
         self.text_splitter = None
-        self.initialized = False
         self.vectorstore_cache = {}
+        self.initialized = False
     
     def initialize(self):
         if self.initialized:
             return
             
-        logger.info("Initializing RELIABILITY OPTIMIZED RAG engine...")
+        logger.info("Initializing ROBUST RAG engine...")
+        os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
+        
+        # Initialize chat model
+        self.chat_model = ChatTogether(
+            model=CHAT_MODEL,
+            temperature=0.2,
+            max_tokens=1500
+        )
+
+        # Text splitter
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1200,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ". "]
+        )
+        
+        self.initialized = True
+        logger.info("RAG engine ready!")
+
+    async def process(self, url: str, questions: List[str]) -> List[str]:
+        if not self.initialized:
+            self.initialize()
         
         try:
-            os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
-            
-            # More reliable embedding model
-            self.embeddings = TogetherEmbeddings(model="togethercomputer/m2-bert-80M-8k-retrieval")
-            
-            # More reliable chat model with faster response
-            self.chat_model = ChatTogether(
-                model="mistralai/Mixtral-8x7B-Instruct-v0.1",
-                temperature=0.2,
-                max_tokens=2000
+            # Strict timeout with buffer
+            return await asyncio.wait_for(
+                self._process(url, questions),
+                timeout=25.0
             )
+        except asyncio.TimeoutError:
+            return ["Info not found - timeout"] * len(questions)
 
-            # Optimized chunking for reliability
-            self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1200,
-                chunk_overlap=120,
-                separators=["\n\n", "\n", ". ", "! ", "? "]
-            )
-
-            self.initialized = True
-            logger.info("RELIABILITY OPTIMIZED RAG engine ready!")
-        except Exception as e:
-            logger.error(f"Initialization error: {e}")
-            raise
-
-    def _reliable_query(self, vectorstore: ReliabilityOptimizedVectorStore, questions: List[str]) -> List[str]:
-        """More reliable query handling with fallback"""
+    async def _process(self, url: str, questions: List[str]) -> List[str]:
+        # Get or create vectorstore
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        vectorstore = self.vectorstore_cache.get(url_hash)
+        
+        if not vectorstore:
+            text = load_document(url)
+            docs = [Document(page_content=text, metadata={"source": url})]
+            chunks = self.text_splitter.split_documents(docs)
+            
+            # Strict chunk limit
+            if len(chunks) > 35:
+                chunks = chunks[:35]
+            
+            vectorstore = RobustVectorStore()
+            vectorstore.add_documents(chunks)
+            self.vectorstore_cache[url_hash] = vectorstore
+        
+        # Generate answers with fallback
         try:
-            # Try batch query first
+            return self._generate_answers(vectorstore, questions)
+        except Exception:
+            return ["Info not found - processing error"] * len(questions)
+
+    def _generate_answers(self, vectorstore: RobustVectorStore, questions: List[str]) -> List[str]:
+        """Generate answers with multiple fallback strategies"""
+        # Try batch processing first
+        try:
             return self._batch_query(vectorstore, questions)
-        except Exception as e:
-            logger.error(f"Batch query failed: {e}, using fallback")
-            return self._fallback_query(vectorstore, questions)
+        except Exception:
+            return self._individual_query(vectorstore, questions)
 
-    def _batch_query(self, vectorstore: ReliabilityOptimizedVectorStore, questions: List[str]) -> List[str]:
-        """Batch processing with better error handling"""
+    def _batch_query(self, vectorstore: RobustVectorStore, questions: List[str]) -> List[str]:
         context = ""
-        for i, q in enumerate(questions[:3]):  # Get context from first 3 questions
+        for q in questions[:3]:  # Get context for first 3 questions
             docs = vectorstore.similarity_search(q, k=2)
-            context += f"Question {i+1}: {q}\nContext: {' '.join(d.page_content for d in docs)[:1500]}\n\n"
+            context += " ".join(d.page_content for d in docs)[:2000] + "\n\n"
         
-        system_content = """You are an insurance policy expert. Answer based ONLY on the context.
-IMPORTANT:
-- Answer in the same order as questions
+        prompt = f"""Answer these questions based solely on the context:
+Context: {context}
+
+Questions: {" | ".join(questions)}
+
+Instructions:
+- Answer in the same order
 - Separate answers with " | "
 - Be concise (1-2 sentences)
-- If unsure: "Info not found"
-- Include key numbers and terms when available"""
+- If answer unknown: "Info not found"
+- Include key numbers when available"""
 
-        question_str = " | ".join(questions)
-        prompt = f"Context:\n{context}\n\nQuestions:\n{question_str}\n\nAnswers:"
-
-        from langchain_core.messages import HumanMessage, SystemMessage
-        messages = [
-            SystemMessage(content=system_content),
-            HumanMessage(content=prompt)
-        ]
-        
-        response = self.chat_model.invoke(messages)
+        from langchain_core.messages import HumanMessage
+        response = self.chat_model.invoke([HumanMessage(content=prompt)])
         return self._parse_answers(response.content, len(questions))
 
-    def _fallback_query(self, vectorstore: ReliabilityOptimizedVectorStore, questions: List[str]) -> List[str]:
-        """Fallback when batch query fails"""
+    def _individual_query(self, vectorstore: RobustVectorStore, questions: List[str]) -> List[str]:
+        """Fallback query method"""
         answers = []
         for q in questions:
             try:
-                docs = vectorstore.similarity_search(q, k=4)
-                context = ' '.join(d.page_content for d in docs)[:2000]
-                
-                prompt = f"Context:\n{context}\n\nQuestion: {q}\nAnswer concisely:"
-                response = self.chat_model.invoke(prompt)
+                docs = vectorstore.similarity_search(q, k=3)
+                context = " ".join(d.page_content for d in docs)[:1500]
+                prompt = f"Context: {context}\n\nQuestion: {q}\nAnswer concisely:"
+                response = self.chat_model.invoke([HumanMessage(content=prompt)])
                 answers.append(response.content.strip())
             except Exception:
                 answers.append("Info not found")
         return answers
 
     def _parse_answers(self, response: str, expected_count: int) -> List[str]:
-        """Robust answer parsing with fallback"""
-        # First try standard separator
-        if " | " in response:
-            parts = response.split(" | ")
-            if len(parts) == expected_count:
-                return [p.strip() for p in parts]
-        
-        # Fallback separators
-        for sep in ["\n", ";", "||", "//"]:
+        # Multiple parsing strategies
+        for sep in [" | ", "\n", ";", "||"]:
             if sep in response:
                 parts = response.split(sep)
                 if len(parts) == expected_count:
                     return [p.strip() for p in parts]
         
-        # Final fallback - return as single answer array
-        return [response.strip()] * expected_count
-
-    async def process_reliable(self, url: str, questions: List[str]) -> List[str]:
-        """Reliability-optimized processing with strict timeout"""
-        if not self.initialized:
-            self.initialize()
-            
-        try:
-            # Enforce strict 25s timeout (5s buffer)
-            return await asyncio.wait_for(
-                self._process_internal(url, questions),
-                timeout=25.0
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Timeout exceeded, returning fallback answers")
-            return ["Info not found - timeout"] * len(questions)
-
-    async def _process_internal(self, url: str, questions: List[str]) -> List[str]:
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-        
-        if url_hash in self.vectorstore_cache:
-            vectorstore = self.vectorstore_cache[url_hash]
-            logger.info("Using cached vectorstore")
-        else:
-            try:
-                docs = reliable_document_loader(url)
-                chunks = self.text_splitter.split_documents(docs)
-                
-                # Enforce chunk limit (45 chunks max)
-                if len(chunks) > 45:
-                    chunks = chunks[:45]
-                    logger.info(f"Truncated to 45 chunks (from {len(chunks)})")
-                
-                vectorstore = ReliabilityOptimizedVectorStore(self.embeddings)
-                vectorstore.add_documents_reliable(chunks)
-                self.vectorstore_cache[url_hash] = vectorstore
-                logger.info(f"Cached vectorstore for {url_hash}")
-            except Exception as e:
-                logger.error(f"Vectorstore creation failed: {e}")
-                # Return fallback answers if we can't process document
-                return ["Info not found - processing error"] * len(questions)
-        
-        try:
-            start_time = time.time()
-            answers = self._reliable_query(vectorstore, questions)
-            logger.info(f"LLM processed in {time.time()-start_time:.1f}s")
-            return answers
-        except Exception as e:
-            logger.error(f"Query failed: {e}")
-            return ["Info not found - query error"] * len(questions)
+        # Fallback: return first N sentences
+        sentences = [s.strip() for s in response.split(". ") if s.strip()]
+        return sentences[:expected_count]
 
 # Global engine
-rag_engine = ReliabilityOptimizedRAGEngine()
+rag_engine = RobustRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
-    if authorization is None or not authorization.startswith("Bearer "):
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization required")
     token = authorization.split("Bearer ")[-1]
     if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    rag_engine.initialize()
-    yield
+app = FastAPI(title="ROBUST RAG API", version="5.0")
 
-app = FastAPI(title="RELIABILITY OPTIMIZED RAG API", version="4.0", lifespan=lifespan)
+@app.on_event("startup")
+async def startup_event():
+    rag_engine.initialize()
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
@@ -357,13 +285,12 @@ async def ask_questions(
         if not request.questions:
             raise HTTPException(status_code=400, detail="No questions provided")
         
-        answers = await rag_engine.process_reliable(request.documents, request.questions)
+        answers = await rag_engine.process(request.documents, request.questions)
         return {"answers": answers}
     
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("Unexpected error")
+    except Exception:
         return {"answers": ["Processing error"] * len(request.questions)}
 
 @app.get("/health")
@@ -371,9 +298,8 @@ async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "reliability_optimized",
-        "timeout": "25s",
-        "max_chunks": 45
+        "embedding_models": EMBEDDING_MODELS,
+        "chat_model": CHAT_MODEL
     }
 
 if __name__ == "__main__":
