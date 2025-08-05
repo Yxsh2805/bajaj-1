@@ -16,20 +16,127 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 from functools import lru_cache
+import json
 
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 from pydantic import BaseModel
 
 # RAG imports
-from langchain_together import ChatTogether, TogetherEmbeddings
+from langchain_together import ChatTogether
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# Free local embeddings
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    logger.warning("sentence-transformers not available, using fallback embeddings")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 EXPECTED_TOKEN = "5aa05ad358e859e92978582cde20423149f28beb49da7a2bbb487afa8fce1be8"
+
+class FreeLocalEmbeddings:
+    """Free local embeddings using sentence-transformers or simple fallback"""
+    
+    def __init__(self):
+        self.model = None
+        self.embedding_dim = 384  # Default dimension
+        if SENTENCE_TRANSFORMERS_AVAILABLE:
+            try:
+                # Use a small, fast, free model that works well
+                self.model = SentenceTransformer('all-MiniLM-L6-v2')
+                self.embedding_dim = self.model.get_sentence_embedding_dimension()
+                logger.info(f"Loaded sentence-transformers model with {self.embedding_dim} dimensions")
+            except Exception as e:
+                logger.warning(f"Failed to load sentence-transformers: {e}")
+                self.model = None
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query text"""
+        return self.embed_documents([text])[0]
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed multiple documents"""
+        if self.model is not None:
+            try:
+                # Use sentence-transformers for real embeddings
+                embeddings = self.model.encode(texts, convert_to_tensor=False)
+                return embeddings.tolist()
+            except Exception as e:
+                logger.error(f"Sentence transformers embedding error: {e}")
+        
+        # Fallback: simple hash-based embeddings (for development only)
+        logger.warning("Using fallback hash-based embeddings")
+        embeddings = []
+        for text in texts:
+            # Create a simple hash-based embedding
+            text_hash = hashlib.md5(text.encode()).hexdigest()
+            # Convert hash to numeric embedding
+            embedding = []
+            for i in range(0, len(text_hash), 2):
+                hex_pair = text_hash[i:i+2]
+                embedding.append(int(hex_pair, 16) / 255.0)  # Normalize to 0-1
+            
+            # Pad or truncate to fixed size
+            while len(embedding) < self.embedding_dim:
+                embedding.append(0.0)
+            embedding = embedding[:self.embedding_dim]
+            embeddings.append(embedding)
+        
+        return embeddings
+
+class TogetherEmbeddingsWrapper:
+    """Custom Together.ai embeddings wrapper to avoid OpenAI dependency"""
+    
+    def __init__(self, api_key: str, model: str = "togethercomputer/m2-bert-80M-8k-retrieval"):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = "https://api.together.xyz/v1"
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query text"""
+        return self.embed_documents([text])[0]
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed multiple documents using Together.ai API"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": self.model,
+                "input": texts
+            }
+            
+            response = requests.post(
+                f"{self.base_url}/embeddings",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                embeddings = []
+                for item in data.get("data", []):
+                    embeddings.append(item.get("embedding", []))
+                return embeddings
+            else:
+                logger.error(f"Together.ai API error: {response.status_code} - {response.text}")
+                # Return dummy embeddings as fallback
+                return [[0.0] * 768 for _ in texts]
+                
+        except Exception as e:
+            logger.error(f"Embedding error: {e}")
+            # Return dummy embeddings as fallback
+            return [[0.0] * 768 for _ in texts]
 
 class QuestionRequest(BaseModel):
     documents: str
@@ -213,9 +320,10 @@ class UltraSpeedRAGEngine:
             api_key = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             os.environ["TOGETHER_API_KEY"] = api_key
             
-            # Fixed: Together.AI embeddings without model_kwargs timeout
-            self.embeddings = TogetherEmbeddings(
-                model="BAAI/bge-base-en-v1.5"
+            # Use custom Together.ai embeddings wrapper to avoid OpenAI dependency
+            self.embeddings = TogetherEmbeddingsWrapper(
+                api_key=api_key,
+                model="togethercomputer/m2-bert-80M-8k-retrieval"
             )
             
             # Faster model with lower latency
