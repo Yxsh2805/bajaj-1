@@ -36,134 +36,140 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-class AccuracyImprovedVectorStore:
+class ReliabilityOptimizedVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
     
-    def add_documents_improved(self, documents: List[Document]):
-        """Improved accuracy while maintaining speed"""
-        logger.info(f"ACCURACY+SPEED: Processing {len(documents)} chunks with 8 workers")
+    def add_documents_reliable(self, documents: List[Document]):
+        """Optimized for reliability with Together.ai API"""
+        logger.info(f"RELIABILITY: Processing {len(documents)} chunks")
         
         start_time = time.time()
+        texts = [doc.page_content for doc in documents]
         
-        def embed_with_smart_retry(doc):
-            """Smart retry - 2 attempts with different strategies"""
-            for attempt in range(2):
-                try:
-                    if attempt == 0:
-                        # First attempt - normal
-                        return self.embeddings.embed_query(doc.page_content)
-                    else:
-                        # Second attempt - shorter delay
-                        time.sleep(0.15)
-                        return self.embeddings.embed_query(doc.page_content)
-                except Exception as e:
-                    if attempt == 1:
-                        logger.warning(f"Embed failed after 2 attempts: {str(e)[:40]}")
-                        return None
+        # Filter out empty texts to prevent 400 errors
+        valid_texts = []
+        valid_docs = []
+        for i, text in enumerate(texts):
+            if text.strip() and len(text) > 10:  # Minimum length check
+                valid_texts.append(text)
+                valid_docs.append(documents[i])
+            else:
+                logger.warning(f"Skipping empty/short chunk: {text[:50]}...")
         
-        # 8 workers - balance between speed and stability
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            vectors = list(executor.map(embed_with_smart_retry, documents))
+        if not valid_texts:
+            logger.error("No valid texts to embed")
+            return
         
-        # Store results
-        successful_count = 0
-        for doc, vector in zip(documents, vectors):
-            if vector is not None:
+        try:
+            # Batch embedding for efficiency (Together.ai supports batch)
+            vectors = self.embeddings.embed_documents(valid_texts)
+            
+            # Store results
+            for doc, vector in zip(valid_docs, vectors):
                 self.documents.append(doc)
                 self.vectors.append(vector)
-                successful_count += 1
-        
-        embedding_time = time.time() - start_time
-        success_rate = (successful_count / len(documents)) * 100
-        logger.info(f"ACCURACY+SPEED: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
-    
-    def similarity_search(self, query: str, k: int = 8) -> List[Document]:
-        """Improved similarity search - back to cosine similarity"""
+            
+            success_rate = (len(vectors) / len(documents)) * 100
+            logger.info(f"RELIABILITY: Embedded {len(vectors)}/{len(documents)} chunks in {time.time()-start_time:.1f}s ({success_rate:.1f}% success)")
+        except Exception as e:
+            logger.error(f"Batch embedding failed: {e}")
+            # Fallback: Individual embedding with retries
+            self._fallback_embedding(valid_docs)
+
+    def _fallback_embedding(self, documents: List[Document]):
+        """Fallback for when batch embedding fails"""
+        logger.warning("Using fallback embedding method")
+        for i, doc in enumerate(documents):
+            try:
+                vector = self.embeddings.embed_query(doc.page_content)
+                self.documents.append(doc)
+                self.vectors.append(vector)
+                # Add delay to avoid rate limiting
+                if i % 5 == 0:
+                    time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Failed to embed chunk {i}: {str(e)[:60]}")
+
+    def similarity_search(self, query: str, k: int = 6) -> List[Document]:
+        """Efficient similarity search with error handling"""
         if not self.vectors:
             return []
         
         try:
             query_vector = self.embeddings.embed_query(query)
-            
-            # Back to proper cosine similarity for accuracy
-            similarities = []
             query_norm = np.linalg.norm(query_vector)
             
-            for i, vector in enumerate(self.vectors):
-                vector_norm = np.linalg.norm(vector)
-                if query_norm > 0 and vector_norm > 0:
-                    cos_sim = np.dot(query_vector, vector) / (query_norm * vector_norm)
-                    similarities.append((cos_sim, i))
-                else:
-                    similarities.append((0.0, i))
+            # Efficient numpy-based cosine similarity
+            vectors_array = np.array(self.vectors)
+            norms = np.linalg.norm(vectors_array, axis=1)
+            valid_mask = (query_norm > 0) & (norms > 0)
             
-            # Sort and return top k (increased from 6 to 8)
-            similarities.sort(reverse=True)
-            top_indices = [idx for _, idx in similarities[:k]]
-            
-            return [self.documents[i] for i in top_indices]
-            
+            if np.any(valid_mask):
+                similarities = np.zeros(len(self.vectors))
+                valid_indices = np.where(valid_mask)[0]
+                similarities[valid_indices] = np.dot(vectors_array[valid_indices], query_vector) / (norms[valid_indices] * query_norm)
+                top_indices = np.argsort(similarities)[-k:][::-1]
+                return [self.documents[i] for i in top_indices]
+            return []
         except Exception as e:
             logger.error(f"Search error: {e}")
-            return self.documents[:k] if len(self.documents) >= k else self.documents
+            return self.documents[:k] if self.documents else []
 
-def improved_document_loader(url: str) -> List[Document]:
-    """Improved document loader - better page coverage"""
+def reliable_document_loader(url: str) -> List[Document]:
+    """Optimized loader for ≤25 page documents"""
     try:
-        response = requests.get(url, timeout=12, headers={'User-Agent': 'Mozilla/5.0'})  # Restored timeout
+        response = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
-        url_lower = url.lower()
         content_type = response.headers.get('content-type', '').lower()
         
-        if url_lower.endswith('.pdf') or 'pdf' in content_type:
-            pdf_file = io.BytesIO(response.content)
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            total_pages = len(pdf_reader.pages)
-            
-            # IMPROVED: Better page sampling for accuracy
-            if total_pages <= 25:
-                pages_to_process = list(range(total_pages))
-            else:
-                # More balanced sampling
-                first_pages = list(range(15))  # More from start (was 12)
-                middle_pages = list(range(total_pages//3, total_pages//3 + 8))  # More from middle (was 5)
-                last_pages = list(range(total_pages-10, total_pages))  # More from end (was 8)
-                pages_to_process = sorted(set(first_pages + middle_pages + last_pages))
-            
-            text = ""
-            for i in pages_to_process:
-                if i < len(pdf_reader.pages):
-                    page_text = pdf_reader.pages[i].extract_text()
-                    if page_text.strip():
-                        text += page_text + "\n\n"
-            
-            logger.info(f"IMPROVED: Processed {len(pages_to_process)}/{total_pages} pages")
-            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
-        
-        elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
-            docx_file = io.BytesIO(response.content)
-            doc = DocxDocument(docx_file)
-            text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
-            return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
-        
+        if 'pdf' in content_type or url.lower().endswith('.pdf'):
+            return _load_pdf(response.content, url)
+        elif 'wordprocessingml' in content_type or url.lower().endswith('.docx'):
+            return _load_docx(response.content, url)
         else:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            for script in soup(["script", "style", "nav", "footer", "header"]):
-                script.decompose()
-            text = soup.get_text()
-            lines = (line.strip() for line in text.splitlines())
-            text = '\n'.join(line for line in lines if line)
-            return [Document(page_content=text[:90000], metadata={"source": url, "type": "html"})]  # Increased limit
-        
+            return _load_html(response.content, url)
     except Exception as e:
         logger.error(f"Document load error: {e}")
-        raise
+        raise HTTPException(status_code=400, detail=f"Document loading failed: {str(e)}")
 
-class AccuracyImprovedRAGEngine:
+def _load_pdf(content: bytes, url: str) -> List[Document]:
+    """Load all pages for PDFs ≤25 pages"""
+    pdf_file = io.BytesIO(content)
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    total_pages = len(pdf_reader.pages)
+    
+    # Process all pages (≤25 pages)
+    text = ""
+    for i in range(total_pages):
+        page_text = pdf_reader.pages[i].extract_text()
+        if page_text.strip():
+            text += f"Page {i+1}: {page_text}\n\n"
+    
+    logger.info(f"Loaded PDF with {total_pages} pages")
+    return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
+
+def _load_docx(content: bytes, url: str) -> List[Document]:
+    """Load DOCX documents"""
+    docx_file = io.BytesIO(content)
+    doc = DocxDocument(docx_file)
+    text = "\n".join([para.text for para in doc.paragraphs])
+    return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
+
+def _load_html(content: bytes, url: str) -> List[Document]:
+    """Load HTML content"""
+    soup = BeautifulSoup(content, 'html.parser')
+    for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        element.decompose()
+    text = soup.get_text()
+    lines = (line.strip() for line in text.splitlines())
+    text = '\n'.join(line for line in lines if line)
+    return [Document(page_content=text[:80000], metadata={"source": url, "type": "html"})]
+
+class ReliabilityOptimizedRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -175,206 +181,202 @@ class AccuracyImprovedRAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing ACCURACY IMPROVED RAG engine...")
+        logger.info("Initializing RELIABILITY OPTIMIZED RAG engine...")
         
         try:
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             
-            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+            # More reliable embedding model
+            self.embeddings = TogetherEmbeddings(model="togethercomputer/m2-bert-80M-8k-retrieval")
             
+            # More reliable chat model with faster response
             self.chat_model = ChatTogether(
-                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-                temperature=0,
-                max_tokens=3200  # Slightly increased for better answers
+                model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+                temperature=0.2,
+                max_tokens=2000
             )
 
-            # IMPROVED chunking - better balance
+            # Optimized chunking for reliability
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1050,    # Increased from 1000
-                chunk_overlap=100,  # Increased from 80
-                separators=["\n\n", "\n", ". ", "! ", "? ", " "]  # Full separators back
+                chunk_size=1200,
+                chunk_overlap=120,
+                separators=["\n\n", "\n", ". ", "! ", "? "]
             )
 
             self.initialized = True
-            logger.info("ACCURACY IMPROVED RAG engine ready!")
-            
+            logger.info("RELIABILITY OPTIMIZED RAG engine ready!")
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def _improved_query(self, vectorstore: AccuracyImprovedVectorStore, query: str) -> str:
-        """Improved query with better context"""
-        docs = vectorstore.similarity_search(query, k=8)  # More context docs
-        context = " ".join([doc.page_content for doc in docs])[:3000]  # More context chars
+    def _reliable_query(self, vectorstore: ReliabilityOptimizedVectorStore, questions: List[str]) -> List[str]:
+        """More reliable query handling with fallback"""
+        try:
+            # Try batch query first
+            return self._batch_query(vectorstore, questions)
+        except Exception as e:
+            logger.error(f"Batch query failed: {e}, using fallback")
+            return self._fallback_query(vectorstore, questions)
+
+    def _batch_query(self, vectorstore: ReliabilityOptimizedVectorStore, questions: List[str]) -> List[str]:
+        """Batch processing with better error handling"""
+        context = ""
+        for i, q in enumerate(questions[:3]):  # Get context from first 3 questions
+            docs = vectorstore.similarity_search(q, k=2)
+            context += f"Question {i+1}: {q}\nContext: {' '.join(d.page_content for d in docs)[:1500]}\n\n"
         
+        system_content = """You are an insurance policy expert. Answer based ONLY on the context.
+IMPORTANT:
+- Answer in the same order as questions
+- Separate answers with " | "
+- Be concise (1-2 sentences)
+- If unsure: "Info not found"
+- Include key numbers and terms when available"""
+
+        question_str = " | ".join(questions)
+        prompt = f"Context:\n{context}\n\nQuestions:\n{question_str}\n\nAnswers:"
+
         from langchain_core.messages import HumanMessage, SystemMessage
-        
-        # Better system prompt for accuracy
-        system_content = """You are an expert insurance policy analyst with high accuracy standards.
-
-CRITICAL INSTRUCTIONS:
-- Input questions are separated by " | "
-- Output answers MUST be separated by " | " in the same order
-- Provide accurate, detailed answers based on the document content
-- Include specific numbers, time periods, conditions, and percentages when available
-- If information is not in the document, state "Information not available in provided document"
-- Keep answers comprehensive but concise
-
-QUALITY REQUIREMENTS:
-- Start with the key information first
-- Include specific details like amounts, time periods, percentages
-- Reference exact conditions and requirements from the document
-- Ensure each answer fully addresses its corresponding question
-- Use precise language from the source document
-
-CRITICAL: Separate each answer with " | " and maintain exact question order."""
-
-        human_content = f"""Answer these questions accurately based on the document:
-
-Questions: {query}
-
-Document Context: {context}
-
-Provide detailed, accurate answers separated by " | " in the same order."""
-
         messages = [
             SystemMessage(content=system_content),
-            HumanMessage(content=human_content)
+            HumanMessage(content=prompt)
         ]
         
         response = self.chat_model.invoke(messages)
-        return response.content
+        return self._parse_answers(response.content, len(questions))
 
-    async def process_improved(self, url: str, questions: List[str]) -> List[str]:
-        """Improved processing - better accuracy within time budget"""
-        if not self.initialized:
-            raise RuntimeError("RAG engine not initialized")
+    def _fallback_query(self, vectorstore: ReliabilityOptimizedVectorStore, questions: List[str]) -> List[str]:
+        """Fallback when batch query fails"""
+        answers = []
+        for q in questions:
+            try:
+                docs = vectorstore.similarity_search(q, k=4)
+                context = ' '.join(d.page_content for d in docs)[:2000]
+                
+                prompt = f"Context:\n{context}\n\nQuestion: {q}\nAnswer concisely:"
+                response = self.chat_model.invoke(prompt)
+                answers.append(response.content.strip())
+            except Exception:
+                answers.append("Info not found")
+        return answers
+
+    def _parse_answers(self, response: str, expected_count: int) -> List[str]:
+        """Robust answer parsing with fallback"""
+        # First try standard separator
+        if " | " in response:
+            parts = response.split(" | ")
+            if len(parts) == expected_count:
+                return [p.strip() for p in parts]
         
+        # Fallback separators
+        for sep in ["\n", ";", "||", "//"]:
+            if sep in response:
+                parts = response.split(sep)
+                if len(parts) == expected_count:
+                    return [p.strip() for p in parts]
+        
+        # Final fallback - return as single answer array
+        return [response.strip()] * expected_count
+
+    async def process_reliable(self, url: str, questions: List[str]) -> List[str]:
+        """Reliability-optimized processing with strict timeout"""
+        if not self.initialized:
+            self.initialize()
+            
         try:
+            # Enforce strict 25s timeout (5s buffer)
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=30.0  # Keep 30s hard limit
+                timeout=25.0
             )
         except asyncio.TimeoutError:
-            raise HTTPException(status_code=408, detail="30 second timeout exceeded")
+            logger.warning("Timeout exceeded, returning fallback answers")
+            return ["Info not found - timeout"] * len(questions)
 
     async def _process_internal(self, url: str, questions: List[str]) -> List[str]:
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         
         if url_hash in self.vectorstore_cache:
             vectorstore = self.vectorstore_cache[url_hash]
-            logger.info("CACHED - INSTANT!")
+            logger.info("Using cached vectorstore")
         else:
-            docs = improved_document_loader(url)
-            chunks = self.text_splitter.split_documents(docs)
-            
-            # IMPROVED: More chunks for better accuracy
-            if len(chunks) > 65:  # Increased from 50 to 65
-                # Better chunk selection strategy
-                keep_first = int(len(chunks) * 0.5)   # 50% from start (was 60%)
-                keep_middle = int(len(chunks) * 0.15) # 15% from true middle
-                keep_last = int(len(chunks) * 0.25)   # 25% from end (was 40%)
+            try:
+                docs = reliable_document_loader(url)
+                chunks = self.text_splitter.split_documents(docs)
                 
-                middle_start = len(chunks) // 2 - keep_middle // 2
-                chunks = (chunks[:keep_first] + 
-                         chunks[middle_start:middle_start + keep_middle] + 
-                         chunks[-keep_last:])
-                         
-                logger.info(f"IMPROVED: {len(chunks)} chunks selected (better coverage)")
-            
-            vectorstore = AccuracyImprovedVectorStore(self.embeddings)
-            vectorstore.add_documents_improved(chunks)
-            
-            # Cache for future use
-            self.vectorstore_cache[url_hash] = vectorstore
+                # Enforce chunk limit (45 chunks max)
+                if len(chunks) > 45:
+                    chunks = chunks[:45]
+                    logger.info(f"Truncated to 45 chunks (from {len(chunks)})")
+                
+                vectorstore = ReliabilityOptimizedVectorStore(self.embeddings)
+                vectorstore.add_documents_reliable(chunks)
+                self.vectorstore_cache[url_hash] = vectorstore
+                logger.info(f"Cached vectorstore for {url_hash}")
+            except Exception as e:
+                logger.error(f"Vectorstore creation failed: {e}")
+                # Return fallback answers if we can't process document
+                return ["Info not found - processing error"] * len(questions)
         
-        batch_query = " | ".join(questions)
-        
-        query_start = time.time()
-        response = self._improved_query(vectorstore, batch_query)
-        query_time = time.time() - query_start
-        
-        logger.info(f"LLM: {query_time:.1f}s")
-        
-        # Improved answer parsing
-        answers = []
-        raw_splits = response.split(" | ")
-        
-        for split in raw_splits:
-            cleaned = split.strip()
-            if cleaned and not cleaned.lower().startswith(('question:', 'answer:')):
-                answers.append(cleaned)
-        
-        # Ensure correct count
-        while len(answers) < len(questions):
-            answers.append("Unable to find specific information in the provided document.")
-        
-        return answers[:len(questions)]
+        try:
+            start_time = time.time()
+            answers = self._reliable_query(vectorstore, questions)
+            logger.info(f"LLM processed in {time.time()-start_time:.1f}s")
+            return answers
+        except Exception as e:
+            logger.error(f"Query failed: {e}")
+            return ["Info not found - query error"] * len(questions)
 
 # Global engine
-rag_engine = AccuracyImprovedRAGEngine()
+rag_engine = ReliabilityOptimizedRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization required")
-    
     token = authorization.split("Bearer ")[-1]
     if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        rag_engine.initialize()
-        logger.info("ACCURACY IMPROVED RAG application ready")
-    except Exception as e:
-        logger.error(f"Startup error: {e}")
+    rag_engine.initialize()
     yield
 
-app = FastAPI(title="ACCURACY IMPROVED RAG API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="RELIABILITY OPTIMIZED RAG API", version="4.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Improved accuracy while maintaining speed"""
     try:
-        logger.info(f"ACCURACY+SPEED: {len(request.questions)} questions - targeting 25-28s")
-
+        logger.info(f"Processing {len(request.questions)} questions")
+        
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
         if not request.questions:
             raise HTTPException(status_code=400, detail="No questions provided")
-
-        start_time = time.time()
-        answers = await rag_engine.process_improved(request.documents, request.questions)
-        total_time = time.time() - start_time
-
-        logger.info(f"ACCURACY+SPEED: Completed in {total_time:.1f}s")
+        
+        answers = await rag_engine.process_reliable(request.documents, request.questions)
         return {"answers": answers}
-
+    
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Processing error: {e}")
-        raise HTTPException(status_code=500, detail="Processing failed")
+        logger.exception("Unexpected error")
+        return {"answers": ["Processing error"] * len(request.questions)}
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "accuracy_improved",
-        "target_time": "25-28_seconds",
-        "embedding_provider": "Together.AI (Accuracy+Speed Mode)"
+        "mode": "reliability_optimized",
+        "timeout": "25s",
+        "max_chunks": 45
     }
-
-@app.get("/")
-async def root():
-    return {"message": "ACCURACY IMPROVED RAG API - Better Balance"}
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, timeout_keep_alive=30)
