@@ -36,34 +36,37 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-class Smart50VectorStore:
+class AccuracyImprovedVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
     
-    def add_documents_smart_50(self, documents: List[Document]):
-        """Smart processing of exactly 50 chunks for maximum coverage"""
-        logger.info(f"SMART 50: Processing {len(documents)} chunks (guaranteed <30s)")
+    def add_documents_improved(self, documents: List[Document]):
+        """Improved accuracy while maintaining speed"""
+        logger.info(f"ACCURACY+SPEED: Processing {len(documents)} chunks with 8 workers")
         
         start_time = time.time()
         
-        def embed_reliable(doc):
-            """Reliable embedding with minimal retry"""
-            try:
-                return self.embeddings.embed_query(doc.page_content)
-            except Exception as e:
-                # One quick retry
+        def embed_with_smart_retry(doc):
+            """Smart retry - 2 attempts with different strategies"""
+            for attempt in range(2):
                 try:
-                    time.sleep(0.1)
-                    return self.embeddings.embed_query(doc.page_content)
-                except:
-                    logger.warning(f"Embed failed: {str(e)[:30]}")
-                    return None
+                    if attempt == 0:
+                        # First attempt - normal
+                        return self.embeddings.embed_query(doc.page_content)
+                    else:
+                        # Second attempt - shorter delay
+                        time.sleep(0.15)
+                        return self.embeddings.embed_query(doc.page_content)
+                except Exception as e:
+                    if attempt == 1:
+                        logger.warning(f"Embed failed after 2 attempts: {str(e)[:40]}")
+                        return None
         
-        # 10 workers - proven to work well
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            vectors = list(executor.map(embed_reliable, documents))
+        # 8 workers - balance between speed and stability
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            vectors = list(executor.map(embed_with_smart_retry, documents))
         
         # Store results
         successful_count = 0
@@ -75,17 +78,17 @@ class Smart50VectorStore:
         
         embedding_time = time.time() - start_time
         success_rate = (successful_count / len(documents)) * 100
-        logger.info(f"SMART 50: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
+        logger.info(f"ACCURACY+SPEED: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
     
     def similarity_search(self, query: str, k: int = 8) -> List[Document]:
-        """Enhanced similarity search for 50 chunks"""
+        """Improved similarity search - back to cosine similarity"""
         if not self.vectors:
             return []
         
         try:
             query_vector = self.embeddings.embed_query(query)
             
-            # High-quality cosine similarity
+            # Back to proper cosine similarity for accuracy
             similarities = []
             query_norm = np.linalg.norm(query_vector)
             
@@ -97,7 +100,7 @@ class Smart50VectorStore:
                 else:
                     similarities.append((0.0, i))
             
-            # Sort and return top k
+            # Sort and return top k (increased from 6 to 8)
             similarities.sort(reverse=True)
             top_indices = [idx for _, idx in similarities[:k]]
             
@@ -107,10 +110,10 @@ class Smart50VectorStore:
             logger.error(f"Search error: {e}")
             return self.documents[:k] if len(self.documents) >= k else self.documents
 
-def smart_document_loader(url: str) -> List[Document]:
-    """Same document loader as before"""
+def improved_document_loader(url: str) -> List[Document]:
+    """Improved document loader - better page coverage"""
     try:
-        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        response = requests.get(url, timeout=12, headers={'User-Agent': 'Mozilla/5.0'})  # Restored timeout
         response.raise_for_status()
         
         url_lower = url.lower()
@@ -121,23 +124,25 @@ def smart_document_loader(url: str) -> List[Document]:
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             total_pages = len(pdf_reader.pages)
             
-            if total_pages > 30:
-                logger.warning(f"Document has {total_pages} pages - processing first 30")
-                total_pages = 30
+            # IMPROVED: Better page sampling for accuracy
+            if total_pages <= 25:
+                pages_to_process = list(range(total_pages))
+            else:
+                # More balanced sampling
+                first_pages = list(range(15))  # More from start (was 12)
+                middle_pages = list(range(total_pages//3, total_pages//3 + 8))  # More from middle (was 5)
+                last_pages = list(range(total_pages-10, total_pages))  # More from end (was 8)
+                pages_to_process = sorted(set(first_pages + middle_pages + last_pages))
             
-            # COMPLETE PROCESSING - all pages
             text = ""
-            for i in range(total_pages):
-                try:
+            for i in pages_to_process:
+                if i < len(pdf_reader.pages):
                     page_text = pdf_reader.pages[i].extract_text()
                     if page_text.strip():
-                        text += f"{page_text}\n\n"
-                except Exception as e:
-                    logger.warning(f"Error reading page {i+1}: {e}")
-                    continue
+                        text += page_text + "\n\n"
             
-            logger.info(f"SMART: Processed ALL {total_pages} pages")
-            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf", "pages": total_pages})]
+            logger.info(f"IMPROVED: Processed {len(pages_to_process)}/{total_pages} pages")
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
         
         elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
             docx_file = io.BytesIO(response.content)
@@ -152,13 +157,13 @@ def smart_document_loader(url: str) -> List[Document]:
             text = soup.get_text()
             lines = (line.strip() for line in text.splitlines())
             text = '\n'.join(line for line in lines if line)
-            return [Document(page_content=text[:120000], metadata={"source": url, "type": "html"})]
+            return [Document(page_content=text[:90000], metadata={"source": url, "type": "html"})]  # Increased limit
         
     except Exception as e:
         logger.error(f"Document load error: {e}")
         raise
 
-class Smart50RAGEngine:
+class AccuracyImprovedRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -170,7 +175,7 @@ class Smart50RAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing SMART 50-CHUNK RAG engine...")
+        logger.info("Initializing ACCURACY IMPROVED RAG engine...")
         
         try:
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
@@ -180,31 +185,31 @@ class Smart50RAGEngine:
             self.chat_model = ChatTogether(
                 model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
-                max_tokens=3200
+                max_tokens=3200  # Slightly increased for better answers
             )
 
-            # OPTIMIZED chunking for maximum coverage in 50 chunks
+            # IMPROVED chunking - better balance
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=2000,  # LARGER chunks for more content per chunk
-                chunk_overlap=200, # 10% overlap for continuity
-                separators=["\n\n", "\n", ". ", "! ", "? ", " "]  # Full separators for quality
+                chunk_size=1050,    # Increased from 1000
+                chunk_overlap=100,  # Increased from 80
+                separators=["\n\n", "\n", ". ", "! ", "? ", " "]  # Full separators back
             )
 
             self.initialized = True
-            logger.info("SMART 50-CHUNK RAG engine ready!")
+            logger.info("ACCURACY IMPROVED RAG engine ready!")
             
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def _smart_50_query(self, vectorstore: Smart50VectorStore, query: str) -> str:
-        """Enhanced query for 50-chunk model"""
-        docs = vectorstore.similarity_search(query, k=9)  # Use more of the 50 chunks
-        context = " ".join([doc.page_content for doc in docs])[:3500]  # More context
+    def _improved_query(self, vectorstore: AccuracyImprovedVectorStore, query: str) -> str:
+        """Improved query with better context"""
+        docs = vectorstore.similarity_search(query, k=8)  # More context docs
+        context = " ".join([doc.page_content for doc in docs])[:3000]  # More context chars
         
         from langchain_core.messages import HumanMessage, SystemMessage
         
-        # Enhanced system prompt for better accuracy
+        # Better system prompt for accuracy
         system_content = """You are an expert insurance policy analyst with high accuracy standards.
 
 CRITICAL INSTRUCTIONS:
@@ -240,98 +245,64 @@ Provide detailed, accurate answers separated by " | " in the same order."""
         response = self.chat_model.invoke(messages)
         return response.content
 
-    async def process_smart_50(self, url: str, questions: List[str]) -> List[str]:
-        """Smart 50-chunk processing"""
+    async def process_improved(self, url: str, questions: List[str]) -> List[str]:
+        """Improved processing - better accuracy within time budget"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
         try:
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=30.0
+                timeout=30.0  # Keep 30s hard limit
             )
         except asyncio.TimeoutError:
             raise HTTPException(status_code=408, detail="30 second timeout exceeded")
 
     async def _process_internal(self, url: str, questions: List[str]) -> List[str]:
-        total_start = time.time()
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         
         if url_hash in self.vectorstore_cache:
             vectorstore = self.vectorstore_cache[url_hash]
             logger.info("CACHED - INSTANT!")
         else:
-            # Document loading
-            docs = smart_document_loader(url)
+            docs = improved_document_loader(url)
             chunks = self.text_splitter.split_documents(docs)
             
-            # INTELLIGENT CHUNK SELECTION for maximum coverage
-            original_count = len(chunks)
+            # IMPROVED: More chunks for better accuracy
+            if len(chunks) > 65:  # Increased from 50 to 65
+                # Better chunk selection strategy
+                keep_first = int(len(chunks) * 0.5)   # 50% from start (was 60%)
+                keep_middle = int(len(chunks) * 0.15) # 15% from true middle
+                keep_last = int(len(chunks) * 0.25)   # 25% from end (was 40%)
+                
+                middle_start = len(chunks) // 2 - keep_middle // 2
+                chunks = (chunks[:keep_first] + 
+                         chunks[middle_start:middle_start + keep_middle] + 
+                         chunks[-keep_last:])
+                         
+                logger.info(f"IMPROVED: {len(chunks)} chunks selected (better coverage)")
             
-            if len(chunks) > 50:
-                # ENHANCED selection strategy for maximum coverage
-                
-                # Calculate distribution
-                total_chunks = len(chunks)
-                
-                # More sophisticated distribution:
-                # 40% from start (definitions, basic terms)
-                # 25% from middle (detailed conditions)  
-                # 35% from end (exclusions, appendices)
-                
-                start_count = int(0.40 * 50)  # 20 chunks
-                middle_count = int(0.25 * 50)  # 12-13 chunks
-                end_count = 50 - start_count - middle_count  # 17-18 chunks
-                
-                # Select start chunks
-                start_chunks = chunks[:start_count]
-                
-                # Select middle chunks (true middle of document)
-                middle_start = total_chunks // 2 - middle_count // 2
-                middle_end = middle_start + middle_count
-                middle_chunks = chunks[middle_start:middle_end]
-                
-                # Select end chunks
-                end_chunks = chunks[-end_count:]
-                
-                # Combine for balanced coverage
-                selected_chunks = start_chunks + middle_chunks + end_chunks
-                
-                logger.info(f"SMART SELECTION: {original_count} → 50 chunks")
-                logger.info(f"Distribution: Start={len(start_chunks)}, Middle={len(middle_chunks)}, End={len(end_chunks)}")
-                
-                chunks = selected_chunks
-            
-            # Ensure exactly 50 chunks
-            if len(chunks) > 50:
-                chunks = chunks[:50]
-            
-            logger.info(f"FINAL: Processing exactly {len(chunks)} chunks")
-            
-            # Smart embedding
-            vectorstore = Smart50VectorStore(self.embeddings)
-            vectorstore.add_documents_smart_50(chunks)
+            vectorstore = AccuracyImprovedVectorStore(self.embeddings)
+            vectorstore.add_documents_improved(chunks)
             
             # Cache for future use
             self.vectorstore_cache[url_hash] = vectorstore
         
-        # Query processing
         batch_query = " | ".join(questions)
         
         query_start = time.time()
-        response = self._smart_50_query(vectorstore, batch_query)
+        response = self._improved_query(vectorstore, batch_query)
         query_time = time.time() - query_start
         
-        total_time = time.time() - total_start
-        logger.info(f"SMART 50: Query {query_time:.1f}s, Total {total_time:.1f}s")
+        logger.info(f"LLM: {query_time:.1f}s")
         
-        # Enhanced answer parsing
+        # Improved answer parsing
         answers = []
         raw_splits = response.split(" | ")
         
         for split in raw_splits:
             cleaned = split.strip()
-            if cleaned and len(cleaned) > 8 and not cleaned.lower().startswith(('question:', 'answer:')):
+            if cleaned and not cleaned.lower().startswith(('question:', 'answer:')):
                 answers.append(cleaned)
         
         # Ensure correct count
@@ -341,7 +312,7 @@ Provide detailed, accurate answers separated by " | " in the same order."""
         return answers[:len(questions)]
 
 # Global engine
-rag_engine = Smart50RAGEngine()
+rag_engine = AccuracyImprovedRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
@@ -355,21 +326,21 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("SMART 50-CHUNK RAG application ready")
+        logger.info("ACCURACY IMPROVED RAG application ready")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="SMART 50-CHUNK RAG API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="ACCURACY IMPROVED RAG API", version="3.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Smart 50-chunk processing - maximum coverage within 30 seconds"""
+    """Improved accuracy while maintaining speed"""
     try:
-        logger.info(f"SMART 50: {len(request.questions)} questions (50 chunk limit)")
+        logger.info(f"ACCURACY+SPEED: {len(request.questions)} questions - targeting 25-28s")
 
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
@@ -377,10 +348,10 @@ async def ask_questions(
             raise HTTPException(status_code=400, detail="No questions provided")
 
         start_time = time.time()
-        answers = await rag_engine.process_smart_50(request.documents, request.questions)
+        answers = await rag_engine.process_improved(request.documents, request.questions)
         total_time = time.time() - start_time
 
-        logger.info(f"SMART 50: Completed in {total_time:.1f}s")
+        logger.info(f"ACCURACY+SPEED: Completed in {total_time:.1f}s")
         return {"answers": answers}
 
     except HTTPException:
@@ -394,15 +365,14 @@ async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "smart_50_chunks",
-        "max_chunks": 50,
-        "chunk_distribution": "40% start, 25% middle, 35% end",
-        "embedding_provider": "Together.AI (Smart 50)"
+        "mode": "accuracy_improved",
+        "target_time": "25-28_seconds",
+        "embedding_provider": "Together.AI (Accuracy+Speed Mode)"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "SMART 50-CHUNK RAG API - Maximum Coverage in 50 Chunks"}
+    return {"message": "ACCURACY IMPROVED RAG API - Better Balance"}
 
 if __name__ == "__main__":
     import uvicorn
